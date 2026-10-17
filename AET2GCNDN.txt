@@ -1,0 +1,1146 @@
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Lighting = game:GetService("Lighting")
+local Workspace = game:GetService("Workspace")
+local CoreGui = game:GetService("CoreGui")
+local VirtualUser = game:GetService("VirtualUser")
+local HttpService = game:GetService("HttpService")
+local LocalPlayer = Players.LocalPlayer
+local Mouse = LocalPlayer:GetMouse()
+local Camera = Workspace.CurrentCamera
+
+local cloneref = (cloneref or clonereference or function(instance) return instance end)
+local ReplicatedStorage = cloneref(game:GetService("ReplicatedStorage"))
+
+local WindUI
+do
+    local ok, result = pcall(function() return require("./src/Init") end)
+    if ok then
+        WindUI = result
+    else
+        if cloneref(game:GetService("RunService")):IsStudio() then
+            WindUI = require(cloneref(ReplicatedStorage:WaitForChild("WindUI"):WaitForChild("Init")))
+        else
+            WindUI = loadstring(game:HttpGet("https://raw.githubusercontent.com/Footagesus/WindUI/main/dist/main.lua"))()
+        end
+    end
+end
+
+-- ====================================================================
+-- [CONFIG & GLOBAL STATES]
+-- ====================================================================
+local States = {
+    InfiniteJump = false, 
+    Speed = false, SpeedValue = 18,
+    ClickTP = false, 
+    Noclip = false, 
+    GodMode = false,
+    WaterWalk = false, 
+    RespawnSamePos = false,
+    
+    -- New / Updated Features
+    DashPower = 50,
+    RhythmWalk = false, RhythmSpeed = 75, RhythmInterval = 1,
+    SavedPointsFly = false, PointFlyMode = "Loop", PointFlySpeed = 50,
+    
+    Hitbox = false, HitboxValue = 10, HitboxTrans = 0.5,
+    CircleLock = false, CircleLockRadius = 150,
+    UltraInstinct = false, UltraInstinctRange = 15, UltraInstinctSound = true,
+    TargetLock = false, SelectedTargetPlayer = nil,
+    FollowTarget = false, TPBelowFeet = false, TPDepth = 5,
+    
+    FPSBoost = false, FPSBoostLite = false, Fullbright = false,
+    ESPPlayers = false, ESPNPC = false,
+    CustomFOV = false, FOV = 70, CustomZoom = false,
+    
+    LowFriction = false, AntiRagdoll = false, AntiFling = false,
+    InstantInteract = false
+}
+
+local savedCFrame = nil
+local CONFIG_FOLDER = "TEMP777_Configs"
+local CurrentConfigName = "โปรไฟล์ของฉัน 1"
+local OriginalHitboxData = {}
+local SavedWaypoints = {}
+local isFlyingToPoints = false
+
+local function SafeGetCharacter() return LocalPlayer.Character end
+local function SafeGetHumanoid() 
+    local c = SafeGetCharacter()
+    return c and c:FindFirstChildOfClass("Humanoid") 
+end
+local function SafeGetHRP() 
+    local c = SafeGetCharacter()
+    return c and c:FindFirstChild("HumanoidRootPart") 
+end
+
+-- Circle Lock Visualizer (Drawing API)
+local CircleDrawing = Drawing.new("Circle")
+CircleDrawing.Visible = false
+CircleDrawing.Transparency = 0.7
+CircleDrawing.Color = Color3.fromRGB(0, 255, 255)
+CircleDrawing.Thickness = 1.5
+CircleDrawing.Filled = false
+
+-- Dash Floating UI Creation (FIXED: ล็อกตำแหน่งสนิท ห้ามลากเคลื่อนที่)
+local DashGui = Instance.new("ScreenGui")
+DashGui.Name = "DashFloatingGui"
+DashGui.ResetOnSpawn = false
+DashGui.IgnoreGuiInset = true
+DashGui.Parent = CoreGui
+
+local DashButton = Instance.new("TextButton")
+DashButton.Name = "DashButton"
+DashButton.Size = UDim2.new(0, 90, 0, 90)
+DashButton.Position = UDim2.new(0.85, 0, 0.6, 0)
+DashButton.BackgroundColor3 = Color3.fromRGB(255, 60, 60)
+DashButton.BorderSizePixel = 0
+DashButton.Text = "พุ่ง"
+DashButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+DashButton.TextSize = 22
+DashButton.Font = Enum.Font.GothamBold
+DashButton.Active = false
+DashButton.Draggable = false
+DashButton.Selectable = false
+DashButton.Visible = false
+DashButton.Parent = DashGui
+
+local UICorner = Instance.new("UICorner")
+UICorner.CornerRadius = UDim.new(1, 0)
+UICorner.Parent = DashButton
+
+DashButton.MouseButton1Click:Connect(function()
+    local hrp = SafeGetHRP()
+    if hrp then
+        hrp.Velocity = hrp.CFrame.LookVector * States.DashPower * 10
+    end
+end)
+
+-- Ultra Instinct Backend Setup
+local ringModel = nil
+local segmentParts = {}
+local ringUpdateConn = nil
+local _lastTeleportTime = 0
+
+local teleportSoundIDs = {
+    "rbxassetid://87566211283329",
+    "rbxassetid://81857580097150",
+    "rbxassetid://129561737395908",
+    "rbxassetid://122312400582724",
+    "rbxassetid://136080815136211"
+}
+
+local function playTeleportSound()
+    if not States.UltraInstinctSound then return end
+    local soundId = teleportSoundIDs[math.random(1, #teleportSoundIDs)]
+    local sound = Instance.new("Sound")
+    sound.SoundId = soundId
+    sound.Volume = 0.7
+    sound.Parent = Workspace
+    sound.Ended:Connect(function() pcall(function() sound:Destroy() end) end)
+    pcall(function() sound:Play() end)
+end
+
+local function isPositionClear(fromPos, toPos, ignoreList)
+    local dir = toPos - fromPos
+    local dist = dir.Magnitude
+    if dist <= 0.01 then return true end
+    local params = RaycastParams.new()
+    params.FilterDescendantsInstances = ignoreList or {}
+    params.FilterType = Enum.RaycastFilterType.Blacklist
+    local result = Workspace:Raycast(fromPos, dir.Unit * dist, params)
+    return result == nil
+end
+
+local function findSafeTeleport(myPos, intrPos, baseOffset, ignoreList)
+    local dir = myPos - intrPos
+    dir = Vector3.new(dir.X, 0, dir.Z)
+    if dir.Magnitude < 0.001 then dir = Vector3.new(1,0,0) else dir = dir.Unit end
+    local left = Vector3.new(-dir.Z, 0, dir.X)
+    local right = Vector3.new(dir.Z, 0, -dir.X)
+    local candidates = {myPos + left * baseOffset, myPos + right * baseOffset}
+    for _, cand in ipairs(candidates) do
+        local fromPos = myPos + Vector3.new(0, 2, 0)
+        local toPos = Vector3.new(cand.X, myPos.Y, cand.Z) + Vector3.new(0, 2, 0)
+        if isPositionClear(fromPos, toPos, ignoreList) then return toPos end
+    end
+    return nil
+end
+
+local function clearUltraInstinctRing()
+    if ringUpdateConn then ringUpdateConn:Disconnect(); ringUpdateConn = nil end
+    if ringModel and ringModel.Parent then ringModel:Destroy(); ringModel = nil end
+    segmentParts = {}
+end
+
+local function createUltraInstinctRing()
+    clearUltraInstinctRing()
+    local radius = States.UltraInstinctRange
+    local char = LocalPlayer.Character
+    if not char or not char.PrimaryPart then return end
+    local root = char.PrimaryPart
+    ringModel = Instance.new("Model")
+    ringModel.Name = "UltraInstinctRing"
+    ringModel.Parent = Workspace
+    local segments = 36
+    for i = 1, segments do
+        local angle = (i-1) * (2 * math.pi / segments)
+        local seg = Instance.new("Part")
+        seg.Anchored = true; seg.CanCollide = false; seg.CastShadow = false
+        seg.Size = Vector3.new(1.0, 0.06, 0.5)
+        seg.Material = Enum.Material.Neon
+        seg.Color = Color3.fromRGB(240, 30, 30)
+        seg.Parent = ringModel
+        local pos = Vector3.new(math.cos(angle) * radius, 0.12, math.sin(angle) * radius)
+        seg.CFrame = CFrame.new(root.Position + pos) * CFrame.Angles(0, -angle, 0)
+        table.insert(segmentParts, seg)
+    end
+    
+    ringUpdateConn = RunService.RenderStepped:Connect(function()
+        if not LocalPlayer.Character or not LocalPlayer.Character.PrimaryPart then clearUltraInstinctRing(); return end
+        local centerPos = LocalPlayer.Character.PrimaryPart.Position
+        for i, seg in ipairs(segmentParts) do
+            if seg and seg.Parent then
+                local angle = (i-1) * (2 * math.pi / #segmentParts)
+                local x = math.cos(angle) * States.UltraInstinctRange
+                local z = math.sin(angle) * States.UltraInstinctRange
+                seg.CFrame = CFrame.new(centerPos + Vector3.new(x, 0.12, z)) * CFrame.Angles(0, -angle, 0)
+            end
+        end
+        for _, pl in pairs(Players:GetPlayers()) do
+            if pl ~= LocalPlayer then
+                local ch = pl.Character
+                if ch and ch.PrimaryPart and ch:FindFirstChildWhichIsA("Humanoid") then
+                    local dist = (ch.PrimaryPart.Position - centerPos).Magnitude
+                    if dist <= States.UltraInstinctRange then
+                        local now = tick()
+                        if now - _lastTeleportTime >= 0.001 then
+                            local safe = findSafeTeleport(centerPos, ch.PrimaryPart.Position, States.UltraInstinctRange + 3, {LocalPlayer.Character, ringModel})
+                            if safe then
+                                local primary = LocalPlayer.Character and LocalPlayer.Character.PrimaryPart
+                                if primary then
+                                    primary.CFrame = CFrame.new(safe + Vector3.new(0, 0.5, 0))
+                                    playTeleportSound()
+                                    _lastTeleportTime = now
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end)
+end
+
+-- ESP System Backend
+local ESPFolder = Instance.new("Folder")
+ESPFolder.Name = "ESP_Folder"
+ESPFolder.Parent = CoreGui
+local ESPCache = {}
+
+local function RemoveESP(t) 
+    if ESPCache[t] then 
+        if ESPCache[t].Bill then ESPCache[t].Bill:Destroy() end 
+        if ESPCache[t].Highlight then ESPCache[t].Highlight:Destroy() end 
+        if ESPCache[t].Box then ESPCache[t].Box:Destroy() end 
+        ESPCache[t] = nil 
+    end 
+end
+
+local function GetOrCreatePlayerESP(character, playerName)
+    if ESPCache[character] then return ESPCache[character] end
+    local head = character:FindFirstChild("Head") or character:FindFirstChild("HumanoidRootPart")
+    if not head then return end
+    local espCol = Color3.fromRGB(74, 222, 128)
+    local bill = Instance.new("BillboardGui")
+    bill.AlwaysOnTop = true; bill.Size = UDim2.new(0, 160, 0, 40); bill.StudsOffset = Vector3.new(0, 3, 0); bill.Adornee = head; bill.Parent = ESPFolder
+    local txt = Instance.new("TextLabel")
+    txt.Size = UDim2.new(1, 0, 1, 0); txt.BackgroundTransparency = 1; txt.Text = "[ผู้เล่น] " .. playerName; txt.TextColor3 = espCol; txt.TextSize = 13; txt.Font = Enum.Font.GothamBold; txt.Parent = bill
+    local highlight = Instance.new("Highlight")
+    highlight.Adornee = character; highlight.FillColor = espCol; highlight.FillTransparency = 0.65; highlight.OutlineColor = espCol; highlight.Parent = character
+    ESPCache[character] = { Bill = bill, Highlight = highlight }
+    return ESPCache[character]
+end
+
+local function GetOrCreateGenericESP(tgt, color, label)
+    if ESPCache[tgt] then return ESPCache[tgt] end
+    local p = tgt:IsA("Model") and (tgt:FindFirstChild("HumanoidRootPart") or tgt.PrimaryPart) or tgt; if not p then return end
+    local bill = Instance.new("BillboardGui"); bill.AlwaysOnTop = true; bill.Size = UDim2.new(0, 140, 0, 40); bill.StudsOffset = Vector3.new(0, 2.5, 0); bill.Adornee = p; bill.Parent = ESPFolder
+    local txt = Instance.new("TextLabel"); txt.Size = UDim2.new(1, 0, 1, 0); txt.BackgroundTransparency = 1; txt.Text = label; txt.TextColor3 = color; txt.TextSize = 12; txt.Font = Enum.Font.GothamBold; txt.Parent = bill
+    local box = Instance.new("BoxHandleAdornment"); box.AlwaysOnTop = true; box.ZIndex = 5; box.Size = tgt:IsA("Model") and tgt:GetExtentsSize() or Vector3.new(3, 3, 3); box.Color3 = color; box.Transparency = 0.5; box.Adornee = p; box.Parent = p
+    ESPCache[tgt] = { Bill = bill, Box = box }
+    return ESPCache[tgt]
+end
+
+task.spawn(function()
+    while true do
+        task.wait(0.5)
+        if States.ESPPlayers then
+            for _, p in pairs(Players:GetPlayers()) do
+                if p ~= LocalPlayer and p.Character then GetOrCreatePlayerESP(p.Character, p.DisplayName) end
+            end
+        else
+            for _, p in pairs(Players:GetPlayers()) do if p.Character then RemoveESP(p.Character) end end
+        end
+
+        if States.ESPNPC then 
+            for _, o in pairs(Workspace:GetDescendants()) do 
+                if o:IsA("Model") and o:FindFirstChildOfClass("Humanoid") and not Players:GetPlayerFromCharacter(o) then GetOrCreateGenericESP(o, Color3.fromRGB(255, 80, 80), "[บอท]") end 
+            end 
+        else 
+            for _, o in pairs(Workspace:GetDescendants()) do 
+                if o:IsA("Model") and o:FindFirstChildOfClass("Humanoid") and not Players:GetPlayerFromCharacter(o) then RemoveESP(o) end 
+            end 
+        end
+        if not States.ESPPlayers and not States.ESPNPC then for k in pairs(ESPCache) do RemoveESP(k) end end
+    end
+end)
+
+-- External Script Actions & Added Scripts
+local function ActionFly() pcall(function() loadstring(game:HttpGet("https://rawscripts.net/raw/Universal-Script-fly-v3-by-hibatzzz-243731"))() end) end
+local function ActionInvisible() pcall(function() loadstring(game:HttpGet("https://rawscripts.net/raw/Universal-Script-FE-Invisible-71225"))() end) end
+local function ActionShiftLock() pcall(function() loadstring(game:HttpGet("https://scriptblox.com/raw/Universal-Script-Shiftlock-script-112993"))() end) end
+local function ActionFlingAll() pcall(function() loadstring(game:HttpGet("https://pastebin.com/raw/8n5Ptfqn"))() end) end
+local function ActionF3X() pcall(function() loadstring(game:HttpGet("https://raw.githubusercontent.com/infyiff/backup/main/f3x.lua"))() end) end
+local function ActionTelekinesis() pcall(function() loadstring(game:HttpGet("https://rawscripts.net/raw/Universal-Script-Telekinesis-12332"))() end) end
+local function ActionInfiniteYield() pcall(function() loadstring(game:HttpGet("https://rawscripts.net/raw/Universal-Script-Admin-Script-(Infinite-Yield)-228460"))() end) end
+local function SpawnPortalGun() pcall(function() loadstring(game:HttpGet("https://dpaste.com/6V5GQ9RLN.txt"))() end) end
+local function ActionAntiPro() pcall(function() loadstring(game:HttpGet("https://dpaste.com/BDAWQHGGS.txt"))() end) end
+local function SaveCurrentPositionScript() 
+    pcall(function() loadstring(game:HttpGet("https://pastefy.app/vFfnTNhJ/raw"))() end)
+end
+
+local function RunBarrierScript() pcall(function() loadstring(game:HttpGet("https://raw.githubusercontent.com/rickandmorty63753882/Shield/refs/heads/main/RickScript.lua"))() end) end
+local function RunInvisScript() pcall(function() loadstring(game:HttpGet("https://dpaste.com/B7S3F5LP7.txt"))() end) end
+local function RunEditScript() pcall(function() loadstring(game:HttpGet("https://pastefy.app/IaP13HcA/raw"))() end) end
+local function RunLiftScript() pcall(function() loadstring(game:HttpGet("https://raw.githubusercontent.com/axionscripts1/Move-Blocks-v20/refs/heads/main/README.md"))() end) end
+local function RunFLV4Script() pcall(function() loadstring(game:HttpGet("https://scriptblox.com/raw/Universal-Script-FLY-GUI-V3-V4-(MOBILE)-230975"))() end) end
+
+-- Reset Hitbox Backend Function
+local function ResetHitboxes()
+    for player, data in pairs(OriginalHitboxData) do
+        if player and player.Character then
+            local hrp = player.Character:FindFirstChild("HumanoidRootPart")
+            if hrp then
+                hrp.Size = data.Size or Vector3.new(2, 2, 1)
+                hrp.Transparency = data.Transparency or 1
+                hrp.Material = data.Material or Enum.Material.Plastic
+            end
+        end
+    end
+    OriginalHitboxData = {}
+end
+
+-- Config Manager Functions with List Support
+local function GetSavedConfigs()
+    local list = {}
+    if listfiles and isfolder(CONFIG_FOLDER) then
+        for _, file in ipairs(listfiles(CONFIG_FOLDER)) do
+            local name = file:match(".+/(.+)%.json$") or file:match(".+\\(.+)%.json$")
+            if name then table.insert(list, name) end
+        end
+    end
+    if #list == 0 then table.insert(list, "ไม่มีไฟล์เซฟ") end
+    return list
+end
+
+local function SaveConfig()
+    if writefile then
+        if not isfolder(CONFIG_FOLDER) then makefolder(CONFIG_FOLDER) end
+        pcall(function() writefile(CONFIG_FOLDER .. "/" .. CurrentConfigName .. ".json", HttpService:JSONEncode(States)) end)
+        WindUI:Notify({ Title = "ระบบบันทึก Config", Content = "บันทึกข้อมูล '" .. CurrentConfigName .. "' เรียบร้อย!", Duration = 3 })
+    end
+end
+
+local function LoadConfig()
+    if readfile and isfile(CONFIG_FOLDER .. "/" .. CurrentConfigName .. ".json") then
+        local success, data = pcall(function() return HttpService:JSONDecode(readfile(CONFIG_FOLDER .. "/" .. CurrentConfigName .. ".json")) end)
+        if success and type(data) == "table" then
+            for k, v in pairs(data) do States[k] = v end
+            WindUI:Notify({ Title = "ระบบบันทึก Config", Content = "โหลด Config '" .. CurrentConfigName .. "' สำเร็จ!", Duration = 3 })
+        end
+    else
+        WindUI:Notify({ Title = "ระบบบันทึก Config", Content = "ไม่พบไฟล์ Config นี้!", Duration = 3 })
+    end
+end
+
+local function DeleteConfig()
+    if delfile and isfile(CONFIG_FOLDER .. "/" .. CurrentConfigName .. ".json") then
+        pcall(function() delfile(CONFIG_FOLDER .. "/" .. CurrentConfigName .. ".json") end)
+        WindUI:Notify({ Title = "ระบบจัดการ Config", Content = "ลบโปรไฟล์ '" .. CurrentConfigName .. "' เรียบร้อยแล้ว", Duration = 3 })
+    end
+end
+
+-- ====================================================================
+-- [WINDUI WINDOW CREATION]
+-- ====================================================================
+local Window = WindUI:CreateWindow({
+    Title = "⚡ TEMP-777 | FIXED HYBRID SCRIPT",
+    Folder = "temp777hub",
+    Icon = "solar:folder-2-bold-duotone",
+    NewElements = true,
+    HideSearchBar = false,
+    OpenButton = {
+        Title = "Open TEMP-777 UI",
+        CornerRadius = UDim.new(1, 0),
+        StrokeThickness = 3,
+        Enabled = true,
+        Draggable = true,
+        OnlyMobile = false,
+        Scale = 0.5,
+        Color = ColorSequence.new(Color3.fromHex("#30FF6A"), Color3.fromHex("#e7ff2f")),
+    },
+    Topbar = { Height = 44, ButtonsType = "Mac" },
+})
+
+-- FPS Calculation State
+local currentFPS = 60
+local lastTick = tick()
+local frameCount = 0
+RunService.RenderStepped:Connect(function()
+    frameCount = frameCount + 1
+    if tick() - lastTick >= 1 then
+        currentFPS = frameCount
+        frameCount = 0
+        lastTick = tick()
+    end
+end)
+
+-- --------------------------------------------------------------------
+-- [TAB 1: หน้าหลัก (Main)]
+-- --------------------------------------------------------------------
+local MainTab = Window:Tab({ Title = "หลัก", Icon = "solar:home-2-bold", Border = true })
+
+local avatarUserId = LocalPlayer.UserId
+local avatarThumb = "https://www.roblox.com/headshot-thumbnail/image?userId=" .. avatarUserId .. "&width=150&height=150&format=png"
+
+local ProfileParagraph = MainTab:Paragraph({
+    Title = LocalPlayer.DisplayName .. " (@" .. LocalPlayer.Name .. ")",
+    Desc = "FPS: 60 | Map: " .. Workspace.Name,
+    Image = avatarThumb,
+    ImageSize = 48,
+})
+
+task.spawn(function()
+    while task.wait(0.5) do
+        local hum = SafeGetHumanoid()
+        local hpText = hum and (math.floor(hum.Health) .. " / " .. math.floor(hum.MaxHealth)) or "0 / 0"
+        ProfileParagraph:SetDesc(
+            "FPS: " .. currentFPS .. " | Health: " .. hpText ..
+            "\nMap: " .. Workspace.Name ..
+            "\nID: " .. game.PlaceId .. " | Players: " .. #Players:GetPlayers()
+        )
+    end
+end)
+
+MainTab:Section({ Title = "🏠 ฟังก์ชันหลักทั่วไป" })
+
+MainTab:Toggle({
+    Title = "1. 🦘 กระโดดไม่จำกัด (Infinite Jump)",
+    Callback = function(v) States.InfiniteJump = v end,
+})
+
+MainTab:Toggle({
+    Title = "2. ⚡ เร่งความเร็วเดิน (Speed)",
+    Callback = function(v) 
+        States.Speed = v 
+        if not v then
+            local hum = SafeGetHumanoid()
+            if hum then hum.WalkSpeed = 16 end
+        end
+    end,
+})
+
+MainTab:Slider({
+    Title = "3. ⚙️ ปรับค่าความเร็วเดิน",
+    Step = 1,
+    Value = { Min = 16, Max = 250, Default = 18 },
+    Callback = function(v) States.SpeedValue = v end,
+})
+
+MainTab:Toggle({
+    Title = "4. 🚀 เปิดหน้าต่างปุ่มพุ่ง (Dash Button)",
+    Callback = function(v) 
+        DashButton.Visible = v 
+    end,
+})
+
+MainTab:Slider({
+    Title = "5. 📏 ปรับระยะความไกลการพุ่ง",
+    Step = 5,
+    Value = { Min = 10, Max = 200, Default = 50 },
+    Callback = function(v) States.DashPower = v end,
+})
+
+MainTab:Toggle({
+    Title = "6. 🏃‍♂️ เดินเร็วเป็นจังหวะ (Rhythm Speed)",
+    Callback = function(v) States.RhythmWalk = v end,
+})
+
+MainTab:Slider({
+    Title = "7. 📈 ปปรับความเร็วช่วงวิ่งเร็ว",
+    Step = 1,
+    Value = { Min = 20, Max = 300, Default = 75 },
+    Callback = function(v) States.RhythmSpeed = v end,
+})
+
+MainTab:Slider({
+    Title = "8. ⏱️ ปรับความเร็วช่วงสลับปกติ (วินาที)",
+    Step = 0.5,
+    Value = { Min = 0.5, Max = 5, Default = 1 },
+    Callback = function(v) States.RhythmInterval = v end,
+})
+
+MainTab:Toggle({
+    Title = "9. 🖱️ คลิกวาร์ป (Click TP)",
+    Callback = function(v) States.ClickTP = v end,
+})
+
+MainTab:Toggle({
+    Title = "10. 👻 ทะลุกำแพง (Noclip)",
+    Callback = function(v) States.Noclip = v end,
+})
+
+MainTab:Toggle({
+    Title = "11. 🛡️ อมตะ (God Mode)",
+    Callback = function(v) States.GodMode = v end,
+})
+
+MainTab:Toggle({
+    Title = "12. 🌊 เดินบนน้ำ (Water Walk)",
+    Callback = function(v) States.WaterWalk = v end,
+})
+
+MainTab:Toggle({
+    Title = "13. 📍 เกิดที่เดิม (Respawn Same Pos)",
+    Callback = function(v) 
+        States.RespawnSamePos = v 
+    end,
+})
+
+MainTab:Section({ Title = "💾 ระบบจัดการโปรไฟล์ (Config Manager)" })
+
+MainTab:Input({
+    Title = "14. ✍️ พิมพ์ชื่อโปรไฟล์ใหม่ที่จะเซฟ",
+    Value = CurrentConfigName,
+    Callback = function(val) CurrentConfigName = val end,
+})
+
+local ConfigDropdown = MainTab:Dropdown({
+    Title = "15. 📂 เลือกรายชื่อโปรไฟล์ที่เคยเซฟไว้",
+    Values = GetSavedConfigs(),
+    Callback = function(selected)
+        if selected ~= "ไม่มีไฟล์เซฟ" then
+            CurrentConfigName = selected
+        end
+    end,
+})
+
+MainTab:Button({
+    Title = "16. 🔄 รีเฟรชรายการเซฟ",
+    Icon = "solar:refresh-bold",
+    Callback = function()
+        ConfigDropdown:SetValues(GetSavedConfigs())
+        WindUI:Notify({ Title = "รายการเซฟ", Content = "อัปเดตรายชื่อโปรไฟล์เรียบร้อย", Duration = 2 })
+    end,
+})
+
+MainTab:Button({
+    Title = "17. 💾 บันทึกเซฟโปรไฟล์นี้",
+    Icon = "solar:disk-bold",
+    Callback = function()
+        SaveConfig()
+        ConfigDropdown:SetValues(GetSavedConfigs())
+    end,
+})
+
+MainTab:Button({
+    Title = "18. 📥 โหลดเซฟโปรไฟล์ที่เลือก",
+    Icon = "solar:play-bold",
+    Color = Color3.fromHex("#8A2BE2"),
+    Callback = LoadConfig,
+})
+
+MainTab:Button({
+    Title = "19. 🗑️ ลบไฟล์เซฟที่เลือก",
+    Icon = "solar:trash-bin-trash-bold",
+    Color = Color3.fromHex("#FF3333"),
+    Callback = function()
+        DeleteConfig()
+        ConfigDropdown:SetValues(GetSavedConfigs())
+    end,
+})
+
+-- --------------------------------------------------------------------
+-- [TAB 2: ผู้เล่น & จุดเซฟ (Players & Waypoints)]
+-- --------------------------------------------------------------------
+local PlayersTab = Window:Tab({ Title = "ผู้เล่น", Icon = "solar:user-bold", Border = true })
+
+PlayersTab:Button({
+    Title = "20. 📌 บันทึกจุดปัจจุบัน (เปิดสคริปต์เซฟจุด)",
+    Callback = SaveCurrentPositionScript,
+})
+
+PlayersTab:Button({
+    Title = "21. 🔫 เสกปืนข้ามมิติริค (Portal Gun)",
+    Callback = SpawnPortalGun,
+})
+
+PlayersTab:Section({ Title = "📍 ระบบเซฟจุดแล้วบิน (Waypoint Fly)" })
+
+PlayersTab:Button({
+    Title = "22. ➕ เพิ่มจุดตำแหน่งปัจจุบัน (Save Waypoint)",
+    Callback = function()
+        local hrp = SafeGetHRP()
+        if hrp then
+            table.insert(SavedWaypoints, hrp.CFrame)
+            WindUI:Notify({ Title = "เซฟจุดสำเร็จ", Content = "บันทึกจุดที่ " .. #SavedWaypoints .. " เรียบร้อย!", Duration = 2 })
+        end
+    end,
+})
+
+PlayersTab:Button({
+    Title = "23. 🗑️ ล้างจุดที่บันทึกทั้งหมด",
+    Callback = function()
+        SavedWaypoints = {}
+        WindUI:Notify({ Title = "ล้างจุดเซฟ", Content = "เคลียร์ข้อมูลจุดทั้งหมดแล้ว", Duration = 2 })
+    end,
+})
+
+PlayersTab:Toggle({
+    Title = "24. ✈️ เปิดระบบบินไปตามจุดที่เซฟ",
+    Callback = function(v) States.SavedPointsFly = v end,
+})
+
+PlayersTab:Dropdown({
+    Title = "25. ⚙️ รูปแบบการบิน",
+    Values = {"Loop (วนซ้ำ 1->2->3->1)", "Sequence (รันตามลำดับแล้วหยุด)"},
+    Callback = function(selected)
+        if selected:find("Loop") then
+            States.PointFlyMode = "Loop"
+        else
+            States.PointFlyMode = "Once"
+        end
+    end,
+})
+
+PlayersTab:Slider({
+    Title = "26. 🚀 ความเร็วในการบินไปจุด (Speed)",
+    Step = 5,
+    Value = { Min = 10, Max = 200, Default = 50 },
+    Callback = function(v) States.PointFlySpeed = v end,
+})
+
+PlayersTab:Section({ Title = "🎯 ระบบติดตามเป้าหมาย (Target Lock)" })
+
+local function GetPlayerOptionsList()
+    local list = {}
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer then 
+            table.insert(list, p.DisplayName .. " (@" .. p.Name .. ")") 
+        end
+    end
+    return list
+end
+
+local TargetDropdown = PlayersTab:Dropdown({
+    Title = "27. 👥 เลือกชื่อผู้เล่นเป้าหมาย (ชื่อเล่น + ชื่อจริง)",
+    Values = GetPlayerOptionsList(),
+    Callback = function(selected)
+        for _, p in ipairs(Players:GetPlayers()) do
+            if selected:find("@" .. p.Name) then
+                States.SelectedTargetPlayer = p
+                break
+            end
+        end
+    end,
+})
+
+PlayersTab:Button({
+    Title = "28. 🔄 รีเฟรชรายชื่อผู้เล่นในห้อง",
+    Callback = function()
+        TargetDropdown:SetValues(GetPlayerOptionsList())
+    end,
+})
+
+PlayersTab:Toggle({
+    Title = "29. 🏃‍♂️ วาร์ปเกาะหลังเป้าหมาย (Follow)",
+    Callback = function(v) States.FollowTarget = v end,
+})
+
+PlayersTab:Toggle({
+    Title = "30. 🎯 วาร์ปไปใต้ตีนเป้าหมาย (TP Below)",
+    Callback = function(v) States.TPBelowFeet = v end,
+})
+
+PlayersTab:Slider({
+    Title = "31. 📏 ระยะห่าง / ความลึก (Depth)",
+    Step = 1,
+    Value = { Min = 1, Max = 50, Default = 5 },
+    Callback = function(v) States.TPDepth = v end,
+})
+
+-- --------------------------------------------------------------------
+-- [TAB 3: สู้ & ฟาร์ม (Combat & Farm)]
+-- --------------------------------------------------------------------
+local CombatTab = Window:Tab({ Title = "สู้ & ฟาร์ม", Icon = "solar:swords-bold", Border = true })
+
+CombatTab:Toggle({
+    Title = "32. 📦 ขยาย Hitbox ผู้เล่น",
+    Callback = function(v) 
+        States.Hitbox = v 
+        if not v then
+            ResetHitboxes()
+        end
+    end,
+})
+
+CombatTab:Slider({
+    Title = "33. 📐 ปรับขนาดความกว้าง Hitbox",
+    Step = 1,
+    Value = { Min = 2, Max = 50, Default = 10 },
+    Callback = function(v) States.HitboxValue = v end,
+})
+
+CombatTab:Slider({
+    Title = "34. 🫥 ปรับความโปร่งใส Hitbox",
+    Step = 0.05,
+    Value = { Min = 0, Max = 1, Default = 0.5 },
+    Callback = function(v) States.HitboxTrans = v end,
+})
+
+CombatTab:Toggle({
+    Title = "35. ⭕ ล็อกเป้ารัศมีวงกลมหน้าจอ (Circle Lock + วงแหวน)",
+    Callback = function(v) States.CircleLock = v end,
+})
+
+CombatTab:Slider({
+    Title = "36. 📏 ปรับขนาดวงกลมล็อกเป้า",
+    Step = 5,
+    Value = { Min = 0, Max = 1000, Default = 150 },
+    Callback = function(v) States.CircleLockRadius = v end,
+})
+
+CombatTab:Button({
+    Title = "37. 🥇 สู้โปร (ดูคนตีคน)",
+    Callback = ActionAntiPro,
+})
+
+CombatTab:Toggle({
+    Title = "38. ⚡ สู้โปรอัตโนมัติ (Ultra Instinct)",
+    Callback = function(v) 
+        States.UltraInstinct = v 
+        if not v then clearUltraInstinctRing() end
+    end,
+})
+
+CombatTab:Slider({
+    Title = "39. 📡 ระยะตรวจจับวงแหวน (Radius)",
+    Step = 1,
+    Value = { Min = 1, Max = 100, Default = 15 },
+    Callback = function(v) States.UltraInstinctRange = v end,
+})
+
+CombatTab:Toggle({
+    Title = "40. 🔊 เสียงเอฟเฟกต์เทเลพอร์ต",
+    Callback = function(v) States.UltraInstinctSound = v end,
+})
+
+CombatTab:Section({ Title = "⚡ ระบบแกล้ง & ความปลอดภัย" })
+
+CombatTab:Button({
+    Title = "41. 💥 ชนกระเด็น (Fling All)",
+    Callback = ActionFlingAll,
+})
+
+CombatTab:Toggle({
+    Title = "42. ⛸️ ลดแรงเสียดทาน (เดินลื่นบนน้ำแข็ง)",
+    Callback = function(v) 
+        States.LowFriction = v 
+        local char = SafeGetCharacter()
+        if char then
+            for _, part in pairs(char:GetDescendants()) do
+                if part:IsA("BasePart") then
+                    if v then
+                        part.CustomPhysicalProperties = PhysicalProperties.new(0.01, 0, 0, 0, 0)
+                    else
+                        part.CustomPhysicalProperties = nil
+                    end
+                end
+            end
+        end
+    end,
+})
+
+CombatTab:Toggle({
+    Title = "43. 🤸‍♂️ กันล้ม (Anti-Ragdoll)",
+    Callback = function(v) States.AntiRagdoll = v end,
+})
+
+CombatTab:Toggle({
+    Title = "44. 🛡️ กันกระเด็น (Anti-Fling)",
+    Callback = function(v) States.AntiFling = v end,
+})
+
+CombatTab:Section({ Title = "⚡ ระบบอำนวยความสะดวก" })
+
+CombatTab:Toggle({
+    Title = "45. ⚡ คลิก / รับของทันที (Instant Interact)",
+    Callback = function(v) States.InstantInteract = v end,
+})
+
+-- --------------------------------------------------------------------
+-- [TAB 4: เครื่องมือ (Tools)]
+-- --------------------------------------------------------------------
+local ToolsTab = Window:Tab({ Title = "เครื่องมือ", Icon = "solar:file-text-bold", Border = true })
+
+ToolsTab:Section({ Title = "🛠️ ฟังก์ชันเสริมเพิ่มเติมตามสั่ง" })
+
+ToolsTab:Button({
+    Title = "46. 🔒 เปิดสคริปต์ Shift Lock",
+    Callback = ActionShiftLock,
+})
+
+ToolsTab:Button({
+    Title = "47. 🛡️ เปิดบาเรียป้องกัน (Barrier)",
+    Callback = RunBarrierScript,
+})
+
+ToolsTab:Button({
+    Title = "48. 👻 เปิดสคริปต์หายตัว (Invisible)",
+    Callback = RunInvisScript,
+})
+
+ToolsTab:Button({
+    Title = "49. 🌋 เปิดสคริปต์แก้ไข (Editor)",
+    Callback = RunEditScript,
+})
+
+ToolsTab:Button({
+    Title = "50. 🧲 เปิดสคริปต์ยกสิ่งของ (อันตราย / ใช้ได้บางแมพ)",
+    Callback = RunLiftScript,
+})
+
+ToolsTab:Button({
+    Title = "51. ✈️ FLV4 (Fly V3/V4 Mobile)",
+    Callback = RunFLV4Script,
+})
+
+ToolsTab:Section({ Title = "⚙️ ระบบหลักเครื่องมือ" })
+
+ToolsTab:Toggle({
+    Title = "52. 🚀 เพิ่มความลื่น FPS (FPS Boost)",
+    Callback = function(v) States.FPSBoost = v end,
+})
+
+ToolsTab:Toggle({
+    Title = "53. 💡 บูส FPS ภาพสว่างชัด (FPS Boost Lite)",
+    Callback = function(v) States.FPSBoostLite = v end,
+})
+
+ToolsTab:Toggle({
+    Title = "54. ☀️ แสงสว่างเต็ม (Fullbright)",
+    Callback = function(v) States.Fullbright = v end,
+})
+
+ToolsTab:Button({
+    Title = "55. 🛠️ เปิดสคริปต์แอดมิน (Infinite Yield)",
+    Callback = ActionInfiniteYield,
+})
+
+ToolsTab:Button({
+    Title = "56. 🧱 เสกเครื่องมือสร้าง (F3X)",
+    Callback = ActionF3X,
+})
+
+ToolsTab:Button({
+    Title = "57. 🌀 พลังจิตหยิบของ (Telekinesis)",
+    Callback = ActionTelekinesis,
+})
+
+ToolsTab:Section({ Title = "📷 ระบบปรับแต่งมุมกล้อง" })
+
+ToolsTab:Toggle({
+    Title = "58. 📷 ปปรับแต่ง FOV กล้อง (CustomFOV)",
+    Callback = function(v) States.CustomFOV = v end,
+})
+
+ToolsTab:Slider({
+    Title = "59. 🔍 องศา FOV กล้อง",
+    Step = 1,
+    Value = { Min = 10, Max = 120, Default = 70 },
+    Callback = function(v) States.FOV = v end,
+})
+
+ToolsTab:Toggle({
+    Title = "60. 🔭 ซูมไกลพิเศษ (Camera Zoom Expanse)",
+    Callback = function(v) States.CustomZoom = v end,
+})
+
+ToolsTab:Section({ Title = "👁️ ระบบมองทะลุ (ESP)" })
+
+ToolsTab:Toggle({
+    Title = "61. 🟢 มองทะลุผู้เล่น (Player ESP)",
+    Callback = function(v) States.ESPPlayers = v end,
+})
+
+ToolsTab:Toggle({
+    Title = "62. 🔴 มองทะลุบอท NPC (NPC ESP)",
+    Callback = function(v) States.ESPNPC = v end,
+})
+
+-- --------------------------------------------------------------------
+-- [TAB 5: ธีม & ตั้งค่า (Theme & Settings)]
+-- --------------------------------------------------------------------
+local ThemeTab = Window:Tab({ Title = "ธีม", Icon = "solar:palette-bold", Border = true })
+
+ThemeTab:Section({ Title = "⚙️ ตั้งค่าเมนูทั่วไป" })
+
+ThemeTab:Slider({
+    Title = "1. 📱 ขนาดเมนู (UI Scale)",
+    Step = 0.05,
+    Value = { Min = 0.5, Max = 2.0, Default = 1.0 },
+    Callback = function(v)
+        pcall(function()
+            Window:SetUIScale(v)
+        end)
+    end,
+})
+
+-- ====================================================================
+-- [CORE RUNTIME LOOPS]
+-- ====================================================================
+LocalPlayer.CharacterAdded:Connect(function(newChar)
+    if States.LowFriction then
+        task.spawn(function()
+            task.wait(0.5)
+            for _, part in pairs(newChar:GetDescendants()) do
+                if part:IsA("BasePart") then
+                    part.CustomPhysicalProperties = PhysicalProperties.new(0.01, 0, 0, 0, 0)
+                end
+            end
+        end)
+    end
+end)
+
+-- Rhythm Walk Loop
+task.spawn(function()
+    while true do
+        task.wait(0.1)
+        if States.RhythmWalk then
+            local hum = SafeGetHumanoid()
+            if hum then
+                hum.WalkSpeed = States.RhythmSpeed
+                for i = 1, math.floor(States.RhythmInterval * 10) do
+                    if not States.RhythmWalk then break end
+                    task.wait(0.1)
+                end
+                
+                if States.RhythmWalk then
+                    hum.WalkSpeed = 16
+                    for i = 1, math.floor(States.RhythmInterval * 10) do
+                        if not States.RhythmWalk then break end
+                        task.wait(0.1)
+                    end
+                else
+                    hum.WalkSpeed = 16
+                end
+            end
+        end
+    end
+end)
+
+-- Waypoint Fly Loop
+task.spawn(function()
+    while true do
+        task.wait(0.1)
+        if States.SavedPointsFly and #SavedWaypoints > 0 and not isFlyingToPoints then
+            isFlyingToPoints = true
+            for _, targetCF in ipairs(SavedWaypoints) do
+                if not States.SavedPointsFly then break end
+                local hrp = SafeGetHRP()
+                if hrp then
+                    local distance = (hrp.Position - targetCF.Position).Magnitude
+                    while distance > 5 and States.SavedPointsFly do
+                        hrp.CFrame = hrp.CFrame:Lerp(targetCF, math.clamp(States.PointFlySpeed / (distance * 10), 0.05, 1))
+                        distance = (hrp.Position - targetCF.Position).Magnitude
+                        task.wait()
+                    end
+                end
+                task.wait(0.5)
+            end
+            isFlyingToPoints = false
+        end
+    end
+end)
+
+RunService.Heartbeat:Connect(function()
+    if States.Speed and not States.RhythmWalk then
+        local hum = SafeGetHumanoid()
+        if hum then hum.WalkSpeed = States.SpeedValue end
+    end
+
+    if States.Noclip then
+        local c = SafeGetCharacter()
+        if c then
+            for _, part in pairs(c:GetDescendants()) do
+                if part:IsA("BasePart") then part.CanCollide = false end
+            end
+        end
+    end
+
+    if States.Hitbox then
+        pcall(function()
+            for _, player in ipairs(Players:GetPlayers()) do
+                if player ~= LocalPlayer and player.Character then
+                    local hrp = player.Character:FindFirstChild("HumanoidRootPart")
+                    if hrp then
+                        if not OriginalHitboxData[player] then
+                            OriginalHitboxData[player] = {
+                                Size = hrp.Size,
+                                Transparency = hrp.Transparency,
+                                Material = hrp.Material
+                            }
+                        end
+                        local s = States.HitboxValue
+                        hrp.Size = Vector3.new(s, s, s)
+                        hrp.Transparency = States.HitboxTrans
+                        hrp.Color = Color3.fromRGB(255, 0, 0)
+                        hrp.Material = Enum.Material.Neon
+                        hrp.CanCollide = false
+                    end
+                end
+            end
+        end)
+    end
+
+    if States.UltraInstinct and not ringModel then createUltraInstinctRing() end
+
+    -- Circle Lock Visualizer Logic
+    if States.CircleLock then
+        CircleDrawing.Visible = true
+        CircleDrawing.Radius = States.CircleLockRadius
+        CircleDrawing.Position = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
+
+        local closestPlayer = nil
+        local shortestDist = States.CircleLockRadius
+        local screenCenter = CircleDrawing.Position
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p ~= LocalPlayer and p.Character then
+                local head = p.Character:FindFirstChild("Head") or p.Character:FindFirstChild("HumanoidRootPart")
+                if head then
+                    local screenPos, onScreen = Camera:WorldToViewportPoint(head.Position)
+                    if onScreen then
+                        local dist = (Vector2.new(screenPos.X, screenPos.Y) - screenCenter).Magnitude
+                        if dist <= States.CircleLockRadius and dist < shortestDist then
+                            shortestDist = dist; closestPlayer = p
+                        end
+                    end
+                end
+            end
+        end
+        if closestPlayer and closestPlayer.Character then
+            local targetHead = closestPlayer.Character:FindFirstChild("Head") or closestPlayer.Character:FindFirstChild("HumanoidRootPart")
+            if targetHead then Camera.CFrame = CFrame.new(Camera.CFrame.Position, targetHead.Position) end
+        end
+    else
+        CircleDrawing.Visible = false
+    end
+
+    if States.CustomFOV then Camera.FieldOfView = States.FOV else Camera.FieldOfView = 70 end
+    if States.CustomZoom then LocalPlayer.CameraMaxZoomDistance = 10000 else LocalPlayer.CameraMaxZoomDistance = 400 end
+
+    if States.AntiRagdoll then
+        local humRef = SafeGetHumanoid()
+        if humRef then
+            local state = humRef:GetState()
+            if humRef.PlatformStand or state == Enum.HumanoidStateType.Physics or state == Enum.HumanoidStateType.Ragdoll or state == Enum.HumanoidStateType.FallingDown or state == Enum.HumanoidStateType.GettingUp then
+                humRef.PlatformStand = false
+                humRef:ChangeState(Enum.HumanoidStateType.Running)
+            end
+        end
+    end
+
+    if States.AntiFling then
+        local hrp = SafeGetHRP()
+        if hrp then
+            if hrp.AssemblyLinearVelocity.Magnitude > 150 or hrp.AssemblyAngularVelocity.Magnitude > 100 then
+                hrp.AssemblyLinearVelocity = Vector3.zero
+                hrp.AssemblyAngularVelocity = Vector3.zero
+            end
+        end
+    end
+
+    if States.InstantInteract then
+        pcall(function()
+            for _, obj in ipairs(Workspace:GetDescendants()) do
+                if obj:IsA("ProximityPrompt") then
+                    obj.HoldDuration = 0
+                    obj.RequiresLineOfSight = false
+                    obj.MaxActivationDistance = math.max(obj.MaxActivationDistance, 30)
+                    fireproximityprompt(obj)
+                end
+            end
+        end)
+    end
+
+    if States.Fullbright then
+        Lighting.Brightness = 2; Lighting.ClockTime = 14; Lighting.GlobalShadows = false; Lighting.OutdoorAmbient = Color3.fromRGB(255, 255, 255)
+    end
+
+    if States.GodMode then 
+        local humRef = SafeGetHumanoid()
+        if humRef then humRef.MaxHealth = math.huge; humRef.Health = math.huge end 
+    end
+
+    if States.WaterWalk then 
+        local hrp = SafeGetHRP() 
+        local humRef = SafeGetHumanoid()
+        if hrp and humRef then 
+            local ray = Ray.new(hrp.Position, Vector3.new(0, -8, 0)) 
+            local hit = Workspace:FindPartOnRay(ray, SafeGetCharacter()) 
+            if hit and (hit.Name:lower():find("water") or hit.Material == Enum.Material.Water) then 
+                hrp.Velocity = Vector3.new(hrp.Velocity.X, 0, hrp.Velocity.Z) 
+                if humRef:GetState() == Enum.HumanoidStateType.Freefall then humRef:ChangeState(Enum.HumanoidStateType.Running) end 
+            end 
+        end 
+    end
+
+    if States.FollowTarget and States.SelectedTargetPlayer and States.SelectedTargetPlayer.Character then
+        local targetHRP = States.SelectedTargetPlayer.Character:FindFirstChild("HumanoidRootPart")
+        local myHRP = SafeGetHRP()
+        if targetHRP and myHRP then
+            local offsetPos = targetHRP.Position - targetHRP.CFrame.LookVector * States.TPDepth
+            myHRP.CFrame = CFrame.new(offsetPos, targetHRP.Position)
+        end
+    end
+
+    if States.TPBelowFeet and States.SelectedTargetPlayer and States.SelectedTargetPlayer.Character then
+        local targetHRP = States.SelectedTargetPlayer.Character:FindFirstChild("HumanoidRootPart")
+        local myHRP = SafeGetHRP()
+        if targetHRP and myHRP then
+            local belowPos = targetHRP.Position + Vector3.new(0, -States.TPDepth, 0)
+            myHRP.CFrame = CFrame.new(belowPos, targetHRP.Position + Vector3.new(0, 2, 0))
+        end
+    end
+end)
+
+UserInputService.JumpRequest:Connect(function() 
+    if States.InfiniteJump then 
+        local hum = SafeGetHumanoid()
+        if hum then hum:ChangeState(Enum.HumanoidStateType.Jumping) end 
+    end 
+end)
+
+Mouse.Button1Down:Connect(function() 
+    if States.ClickTP then 
+        local hrp = SafeGetHRP()
+        if hrp and Mouse.Hit then hrp.CFrame = CFrame.new(Mouse.Hit.Position + Vector3.new(0, 3, 0)) end 
+    end 
+end)
+
+LocalPlayer.Idled:Connect(function()
+    VirtualUser:CaptureController()
+    VirtualUser:ClickButton2(Vector2.new())
+end)
